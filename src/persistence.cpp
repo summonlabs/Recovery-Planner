@@ -59,11 +59,12 @@ class FilePersistenceStore final : public PersistenceStore {
       if (!ofs) throw RecoveryError(ErrorCode::PERSISTENCE_CORRUPTION, "cannot open temp file for write");
       ofs.write(reinterpret_cast<const char*>(w.data().data()),
                 static_cast<std::streamsize>(w.size()));
+      ofs.flush();
       if (!ofs) throw RecoveryError(ErrorCode::PERSISTENCE_CORRUPTION, "failed to write temp persistence frame");
     }
-    // Atomic replace: remove old, rename temp into place.
+    // Atomic replace: rename the temp file over the committed frame. The old frame is not
+    // removed first, so there is never a moment without a committed frame.
     std::error_code ec;
-    fs::remove(path, ec);
     fs::rename(tmp, path, ec);
     if (ec) throw RecoveryError(ErrorCode::PERSISTENCE_CORRUPTION, "failed to commit persistence frame: " + ec.message());
   }

@@ -166,3 +166,75 @@ RP_TEST(ambiguous_completion_does_not_fabricate_success) {
   RP_CHECK(p.execution_outcome == ExecutionOutcome::AMBIGUOUS);
   RP_CHECK(p.outcome_published == false);
 }
+
+// ---------------------------------------------------------------------------
+// Regression tests: evidence that was read but never enforced.
+// ---------------------------------------------------------------------------
+RP_TEST(invalid_authority_evidence_is_rejected) {
+  auto ctx = make_context();
+  for (int i = 0; i < 4; ++i) {
+    auto c = make_candidate(RecoveryStrategy::RESTORE, 1);
+    if (i == 0) c.authority->coordinator_authority_valid = false;
+    if (i == 1) c.authority->policy_authority_valid = false;
+    if (i == 2) c.authority->candidate_authority_valid = false;
+    if (i == 3) c.authority->execution_authority_valid = false;
+    auto ev = evaluate_feasibility(c, make_request(), ctx);
+    RP_CHECK(ev.result == FeasibilityResult::INFEASIBLE);
+  }
+  // Authority evidence that is not current is not sufficient either.
+  auto c = make_candidate(RecoveryStrategy::RESTORE, 1);
+  c.authority->meta.freshness = Freshness::STALE;
+  RP_CHECK(evaluate_feasibility(c, make_request(), ctx).result ==
+           FeasibilityResult::INSUFFICIENT_EVIDENCE);
+  c.authority->meta.freshness = Freshness::REVALIDATION_REQUIRED;
+  RP_CHECK(evaluate_feasibility(c, make_request(), ctx).result ==
+           FeasibilityResult::REVALIDATION_REQUIRED);
+}
+
+// ---------------------------------------------------------------------------
+RP_TEST(availability_evidence_must_describe_the_target) {
+  auto ctx = make_context();
+  // The plan would run on worker B, but the only availability evidence is about worker A.
+  auto c = make_candidate(RecoveryStrategy::RESTORE, 1);
+  c.target_worker = kWorkerB;
+  c.target_boot = kBootB;
+  RP_CHECK(evaluate_feasibility(c, make_request(), ctx).result == FeasibilityResult::INFEASIBLE);
+
+  // Same worker, another boot.
+  auto c2 = make_candidate(RecoveryStrategy::RESTORE, 2);
+  c2.target_boot = WorkerBootId(101);
+  RP_CHECK(evaluate_feasibility(c2, make_request(), ctx).result == FeasibilityResult::INFEASIBLE);
+
+  // Evidence about the target itself is accepted.
+  auto c3 = make_candidate(RecoveryStrategy::RESTORE, 3);
+  c3.target_worker = kWorkerB;
+  c3.target_boot = kBootB;
+  c3.availability->worker = kWorkerB;
+  c3.availability->boot = kBootB;
+  RP_CHECK(evaluate_feasibility(c3, make_request(), ctx).result == FeasibilityResult::FEASIBLE);
+}
+
+// ---------------------------------------------------------------------------
+RP_TEST(restore_requires_a_usable_checkpoint) {
+  auto ctx = make_context();
+  auto corrupt = make_candidate(RecoveryStrategy::RESTORE, 1);
+  corrupt.checkpoint->integrity = StateIntegrity::CORRUPT;
+  RP_CHECK(evaluate_feasibility(corrupt, make_request(), ctx).result ==
+           FeasibilityResult::INFEASIBLE);
+
+  auto expired = make_candidate(RecoveryStrategy::RESTORE, 2);
+  expired.checkpoint->meta.freshness = Freshness::EXPIRED;
+  RP_CHECK(evaluate_feasibility(expired, make_request(), ctx).result ==
+           FeasibilityResult::INFEASIBLE);
+
+  auto unverified = make_candidate(RecoveryStrategy::RESTORE, 3);
+  unverified.checkpoint->integrity = StateIntegrity::NOT_VERIFIED;
+  RP_CHECK(evaluate_feasibility(unverified, make_request(), ctx).result ==
+           FeasibilityResult::INSUFFICIENT_EVIDENCE);
+
+  // A strategy that does not read the checkpoint is not affected by it.
+  auto restart = make_candidate(RecoveryStrategy::RESTART, 4);
+  restart.checkpoint->integrity = StateIntegrity::CORRUPT;
+  RP_CHECK(evaluate_feasibility(restart, make_request(), ctx).result ==
+           FeasibilityResult::FEASIBLE);
+}

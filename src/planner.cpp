@@ -127,6 +127,9 @@ WhatWouldChange compute_what_would_change(const RecoveryRequest& /*req*/,
 
 }  // namespace
 
+// Marks the per-plan hard-objective records that follow the version-1 snapshot body ("RPOB").
+constexpr std::uint32_t kPlanObjectiveMarker = 0x52504F42u;
+
 class RecoveryPlanner::Impl {
  public:
   std::shared_ptr<Clock> clock_;
@@ -139,6 +142,8 @@ class RecoveryPlanner::Impl {
   std::vector<std::string> history_;
   std::uint64_t next_plan_id_{1};
   std::uint64_t next_generation_{1};
+  // Dispatch attempts are numbered across all plans: a dispatch id names one dispatch.
+  std::uint64_t next_attempt_{1};
 
   explicit Impl(std::shared_ptr<Clock> clock, std::shared_ptr<PersistenceStore> store)
       : clock_(std::move(clock)), store_(std::move(store)) {
@@ -156,10 +161,19 @@ class RecoveryPlanner::Impl {
   Timestamp now() const { return clock_ ? clock_->now() : Timestamp(0); }
 
   // ---- snapshots -----------------------------------------------------------
+  struct Decoded {
+    PlannerContext ctx_;
+    std::map<std::uint64_t, RecoveryRequest> requests_;
+    std::map<std::uint64_t, RecoveryPlan> plans_;
+    std::vector<std::string> history_;
+  };
   std::vector<std::uint8_t> encode_snapshot() const;
+  static bool decode_snapshot(const std::vector<std::uint8_t>& bytes, bool preserve_epoch_boot, Decoded& d);
   bool apply_snapshot(const std::vector<std::uint8_t>& bytes, bool preserve_epoch_boot);
   void save_locked();
-  void load_locked();
+  bool load_locked();
+  // Refuse a plan that violates a hard objective of its request or whose deadline has passed.
+  void require_executable(RecoveryPlan& stored);
 
   // ---- planning ------------------------------------------------------------
   std::vector<std::size_t> rank_feasible(RecoveryDecision& d, std::vector<std::size_t> idx) const;
@@ -275,41 +289,60 @@ std::vector<std::uint8_t> RecoveryPlanner::Impl::encode_snapshot() const {
   w.u32(static_cast<std::uint32_t>(history_.size()));
   for (const auto& h : history_) w.cstring(h.c_str());
 
+  // Extension after the version-1 body: the hard-objective verdict of each plan. Without it
+  // a reloaded fallback plan would no longer be known to violate its deadline or tolerance.
+  // A snapshot that ends after the history (written before this extension) still loads.
+  w.u32(kPlanObjectiveMarker);
+  w.u32(static_cast<std::uint32_t>(plans_.size()));
+  for (const auto& kv : plans_) {
+    const auto& p = kv.second;
+    w.u64(p.plan_id.value());
+    w.u8(static_cast<std::uint8_t>(p.deadline.outcome));
+    w.u8(p.deadline.deadline.has_value() ? 1 : 0);
+    if (p.deadline.deadline) w.i64(p.deadline.deadline->value());
+    w.u8(p.economics.max_tolerated_progress_loss.has_value() ? 1 : 0);
+    if (p.economics.max_tolerated_progress_loss) w.u64(p.economics.max_tolerated_progress_loss->value());
+    w.u8(p.economics.progress_loss_within_tolerance ? 1 : 0);
+  }
+
   return w.take();
 }
 
-bool RecoveryPlanner::Impl::apply_snapshot(const std::vector<std::uint8_t>& bytes,
-                                           bool preserve_epoch_boot) {
+bool RecoveryPlanner::Impl::decode_snapshot(const std::vector<std::uint8_t>& bytes,
+                                            bool preserve_epoch_boot, Decoded& d) {
   ByteReader r(bytes);
   std::uint32_t ver = r.u32();
   if (ver != kPersistenceFormatVersion || !r.ok()) return false;
 
   if (!preserve_epoch_boot) {
-    ctx_.epoch = CoordinatorEpoch(r.u64());
-    ctx_.planner_boot = PlannerBootId(r.u64());
+    d.ctx_.epoch = CoordinatorEpoch(r.u64());
+    d.ctx_.planner_boot = PlannerBootId(r.u64());
   } else {
     r.u64();  // epoch (discard, keep advanced)
     r.u64();  // planner_boot (discard)
   }
-  ctx_.workload_generation = WorkloadGeneration(r.u64());
-  ctx_.policy_generation = PolicyGeneration(r.u64());
-  ctx_.compatibility_generation = CompatibilityGeneration(r.u64());
-  ctx_.resource_generation = ResourceGeneration(r.u64());
-  ctx_.topology_generation = TopologyGeneration(r.u64());
+  d.ctx_.workload_generation = WorkloadGeneration(r.u64());
+  d.ctx_.policy_generation = PolicyGeneration(r.u64());
+  d.ctx_.compatibility_generation = CompatibilityGeneration(r.u64());
+  d.ctx_.resource_generation = ResourceGeneration(r.u64());
+  d.ctx_.topology_generation = TopologyGeneration(r.u64());
   if (!r.ok()) return false;
 
-  ctx_.worker_boots.clear();
+  d.ctx_.worker_boots.clear();
   std::uint32_t wcount = r.u32();
+  if (!r.ok() || wcount > r.remaining()) return false;   // a count never exceeds the bytes left
   for (std::uint32_t i = 0; i < wcount; ++i) {
     WorkerId w(r.u64());
     WorkerBootId b(r.u64());
-    ctx_.worker_boots[w] = b;
+    if (!r.ok()) return false;
+    d.ctx_.worker_boots[w] = b;
   }
   // alive_workers is dynamic and explicitly NOT restored.
-  ctx_.alive_workers.clear();
+  d.ctx_.alive_workers.clear();
 
-  requests_.clear();
+  d.requests_.clear();
   std::uint32_t rcount = r.u32();
+  if (!r.ok() || rcount > r.remaining()) return false;
   for (std::uint32_t i = 0; i < rcount; ++i) {
     RecoveryRequest q;
     q.request_id = RecoveryRequestId(r.u64());
@@ -323,23 +356,29 @@ bool RecoveryPlanner::Impl::apply_snapshot(const std::vector<std::uint8_t>& byte
     if (r.u8()) q.max_recovery_duration = Duration(r.i64());
     if (r.u8()) q.max_tolerated_progress_loss = ProgressUnits(r.u64());
     std::uint32_t n = r.u32();
+    if (!r.ok() || n > r.remaining()) return false;
     for (std::uint32_t j = 0; j < n; ++j) q.preferred_strategies.push_back(static_cast<RecoveryStrategy>(r.u8()));
     n = r.u32();
+    if (!r.ok() || n > r.remaining()) return false;
     for (std::uint32_t j = 0; j < n; ++j) q.forbidden_strategies.push_back(static_cast<RecoveryStrategy>(r.u8()));
     q.coordinator_epoch = CoordinatorEpoch(r.u64());
     q.policy_generation = PolicyGeneration(r.u64());
     q.topology_generation = TopologyGeneration(r.u64());
     q.requested_at = Timestamp(r.i64());
     std::uint32_t cnt;
-    cnt = r.u32(); for (std::uint32_t j = 0; j < cnt; ++j) q.state_requirements.push_back(r.cstring());
-    cnt = r.u32(); for (std::uint32_t j = 0; j < cnt; ++j) q.placement_constraints.push_back(r.cstring());
-    cnt = r.u32(); for (std::uint32_t j = 0; j < cnt; ++j) q.compatibility_requirements.push_back(r.cstring());
+    cnt = r.u32(); if (!r.ok() || cnt > r.remaining()) return false;
+    for (std::uint32_t j = 0; j < cnt; ++j) q.state_requirements.push_back(r.cstring());
+    cnt = r.u32(); if (!r.ok() || cnt > r.remaining()) return false;
+    for (std::uint32_t j = 0; j < cnt; ++j) q.placement_constraints.push_back(r.cstring());
+    cnt = r.u32(); if (!r.ok() || cnt > r.remaining()) return false;
+    for (std::uint32_t j = 0; j < cnt; ++j) q.compatibility_requirements.push_back(r.cstring());
     if (!r.ok()) return false;
-    requests_[q.request_id.value()] = q;
+    d.requests_[q.request_id.value()] = q;
   }
 
-  plans_.clear();
+  d.plans_.clear();
   std::uint32_t pcount = r.u32();
+  if (!r.ok() || pcount > r.remaining()) return false;
   for (std::uint32_t i = 0; i < pcount; ++i) {
     RecoveryPlan p;
     p.plan_id = RecoveryPlanId(r.u64());
@@ -378,13 +417,61 @@ bool RecoveryPlanner::Impl::apply_snapshot(const std::vector<std::uint8_t>& byte
     p.dispatch_payload = r.cstring();
     p.decision_digest = r.cstring();
     if (!r.ok()) return false;
-    plans_[p.plan_id.value()] = p;
+    // Enumerations are range-checked: a snapshot never yields an undefined state.
+    if (static_cast<std::uint8_t>(p.strategy) > static_cast<std::uint8_t>(RecoveryStrategy::RECOMPUTE) ||
+        static_cast<std::uint8_t>(p.state) > static_cast<std::uint8_t>(PlanLifecycleState::INVALIDATED) ||
+        static_cast<std::uint8_t>(p.execution_outcome) > static_cast<std::uint8_t>(ExecutionOutcome::CANCELLED))
+      return false;
+    d.plans_[p.plan_id.value()] = p;
   }
 
-  history_.clear();
+  d.history_.clear();
   std::uint32_t hcount = r.u32();
-  for (std::uint32_t i = 0; i < hcount; ++i) history_.push_back(r.cstring());
+  if (!r.ok() || hcount > r.remaining()) return false;
+  for (std::uint32_t i = 0; i < hcount; ++i) d.history_.push_back(r.cstring());
   if (!r.ok()) return false;
+
+  if (r.remaining() != 0) {
+    const std::uint32_t marker = r.u32();
+    const std::uint32_t ocount = r.u32();
+    if (!r.ok() || marker != kPlanObjectiveMarker || ocount != d.plans_.size()) return false;
+    for (std::uint32_t i = 0; i < ocount; ++i) {
+      const std::uint64_t id = r.u64();
+      const std::uint8_t outcome = r.u8();
+      auto it = d.plans_.find(id);
+      if (!r.ok() || it == d.plans_.end() ||
+          outcome > static_cast<std::uint8_t>(DeadlineOutcome::UNKNOWN))
+        return false;
+      RecoveryPlan& p = it->second;
+      p.deadline.outcome = static_cast<DeadlineOutcome>(outcome);
+      if (r.u8()) p.deadline.deadline = Timestamp(r.i64());
+      if (r.u8()) p.economics.max_tolerated_progress_loss = ProgressUnits(r.u64());
+      p.economics.progress_loss_within_tolerance = r.u8() != 0;
+      if (!r.ok()) return false;
+    }
+  }
+  if (r.remaining() != 0) return false;   // trailing bytes are not part of a snapshot
+  return true;
+}
+
+bool RecoveryPlanner::Impl::apply_snapshot(const std::vector<std::uint8_t>& bytes,
+                                           bool preserve_epoch_boot) {
+  // Decode into a copy and adopt it only when the whole snapshot was accepted, so a rejected
+  // snapshot never leaves a partly loaded planner.
+  Decoded d;
+  d.ctx_ = ctx_;
+  if (!decode_snapshot(bytes, preserve_epoch_boot, d)) return false;
+  ctx_ = std::move(d.ctx_);
+  requests_ = std::move(d.requests_);
+  plans_ = std::move(d.plans_);
+  history_ = std::move(d.history_);
+  // Identities the recovered state already uses are never issued again.
+  for (const auto& kv : plans_) {
+    const RecoveryPlan& p = kv.second;
+    next_plan_id_ = std::max(next_plan_id_, p.plan_id.value() + 1);
+    next_generation_ = std::max(next_generation_, p.generation.value() + 1);
+    next_attempt_ = std::max(next_attempt_, p.last_attempt.value() + 1);
+  }
   return true;
 }
 
@@ -397,11 +484,35 @@ void RecoveryPlanner::Impl::save_locked() {
   store_->save("planner_state", snap);
 }
 
-void RecoveryPlanner::Impl::load_locked() {
-  if (!store_) return;
+bool RecoveryPlanner::Impl::load_locked() {
+  if (!store_) return false;
   auto blob = store_->load("planner_state");
-  if (!blob) return;
-  apply_snapshot(*blob, false);
+  if (!blob) {
+    // The store returns nothing both when the state was never saved and when it rejected
+    // the stored frame. A key that exists but does not load is a rejected frame.
+    for (const auto& k : store_->keys())
+      if (k == "planner_state") return false;
+    return true;   // nothing stored yet
+  }
+  return apply_snapshot(*blob, false);
+}
+
+void RecoveryPlanner::Impl::require_executable(RecoveryPlan& stored) {
+  // A fallback plan that misses the hard deadline or the tolerated progress loss is a labeled
+  // alternative, not an executable plan.
+  if (stored.deadline.outcome == DeadlineOutcome::VIOLATED)
+    throw RecoveryError(ErrorCode::INFEASIBLE_CANDIDATE, "plan violates the recovery deadline");
+  if (stored.economics.max_tolerated_progress_loss.has_value() &&
+      !stored.economics.progress_loss_within_tolerance)
+    throw RecoveryError(ErrorCode::INFEASIBLE_CANDIDATE, "plan exceeds the tolerated progress loss");
+  // A plan whose deadline has passed expires instead of being authorized or dispatched.
+  if (stored.deadline.deadline.has_value() && now().value() > stored.deadline.deadline->value()) {
+    if (validate_plan_transition(stored.state, PlanLifecycleState::EXPIRED)) {
+      stored.state = PlanLifecycleState::EXPIRED;
+      stored.updated_at = now();
+    }
+    throw RecoveryError(ErrorCode::STALE_AUTHORITY, "plan expired: its recovery deadline has passed");
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +812,7 @@ RecoveryPlan RecoveryPlanner::authorize_plan(const RecoveryPlan& plan) {
     throw RecoveryError(ErrorCode::STALE_AUTHORITY, "plan authority is stale");
   if (!validate_plan_transition(stored.state, PlanLifecycleState::AUTHORIZED))
     throw RecoveryError(ErrorCode::INVALID_INPUT, "cannot authorize from current lifecycle state");
+  impl_->require_executable(stored);
   stored.state = PlanLifecycleState::AUTHORIZED;
   stored.updated_at = impl_->now();
   return stored;
@@ -717,6 +829,13 @@ RecoveryPlan RecoveryPlanner::revalidate_plan(const RecoveryPlan& plan) {
   // Deadline must still be viable.
   if (stored.deadline.outcome == DeadlineOutcome::VIOLATED)
     throw RecoveryError(ErrorCode::STALE_AUTHORITY, "revalidation failed: deadline no longer viable");
+  if (stored.deadline.deadline.has_value() &&
+      impl_->now().value() > stored.deadline.deadline->value())
+    throw RecoveryError(ErrorCode::STALE_AUTHORITY, "revalidation failed: recovery deadline has passed");
+  if (stored.economics.max_tolerated_progress_loss.has_value() &&
+      !stored.economics.progress_loss_within_tolerance)
+    throw RecoveryError(ErrorCode::STALE_AUTHORITY,
+                        "revalidation failed: plan exceeds the tolerated progress loss");
   return stored;
 }
 
@@ -743,9 +862,10 @@ RecoveryPlan RecoveryPlanner::dispatch_plan(const RecoveryPlan& plan, IRecoveryE
     }
     if (!validate_plan_transition(stored.state, PlanLifecycleState::DISPATCHED))
       throw RecoveryError(ErrorCode::INVALID_INPUT, "cannot dispatch from current state");
+    impl_->require_executable(stored);
 
     stored.updated_at = impl_->now();
-    stored.last_attempt = AttemptId(stored.last_attempt.value() + 1);
+    stored.last_attempt = AttemptId(impl_->next_attempt_++);
     dispatch.dispatch_id = DispatchId(stored.last_attempt.value());
     dispatch.plan_id = stored.plan_id;
     dispatch.plan_generation = stored.generation;
@@ -764,7 +884,22 @@ RecoveryPlan RecoveryPlanner::dispatch_plan(const RecoveryPlan& plan, IRecoveryE
   }
 
   // Release the lock before the backend call (no network wait under a state lock).
-  auto receipt = executor.dispatch(dispatch);
+  RecoveryReceipt receipt;
+  try {
+    receipt = executor.dispatch(dispatch);
+  } catch (...) {
+    // The adapter did not take the dispatch: the plan must not stay DISPATCHED for good.
+    std::lock_guard<std::mutex> lk(impl_->mu_);
+    impl_->dispatch_meta_.erase(dispatch.dispatch_id.value());
+    auto it = impl_->plans_.find(plan.plan_id.value());
+    if (it != impl_->plans_.end() && it->second.state == PlanLifecycleState::DISPATCHED) {
+      it->second.state = PlanLifecycleState::FAILED;
+      it->second.execution_outcome = ExecutionOutcome::UNKNOWN;
+      it->second.outcome_published = false;
+      it->second.updated_at = impl_->now();
+    }
+    throw;
+  }
 
   std::lock_guard<std::mutex> lk(impl_->mu_);
   auto it = impl_->plans_.find(plan.plan_id.value());
@@ -927,8 +1062,7 @@ bool RecoveryPlanner::save_state() {
 bool RecoveryPlanner::load_state() {
   std::lock_guard<std::mutex> lk(impl_->mu_);
   if (!impl_->store_) return false;
-  impl_->load_locked();
-  return true;
+  return impl_->load_locked();
 }
 void RecoveryPlanner::restart_coordinator() {
   std::lock_guard<std::mutex> lk(impl_->mu_);
@@ -966,17 +1100,31 @@ void RecoveryPlanner::restart_coordinator() {
   }
   impl_->history_.push_back("coordinator restart; epoch=" + std::to_string(impl_->ctx_.epoch.value()) +
                             " boot=" + std::to_string(impl_->ctx_.planner_boot.value()));
+  // Dispatches of the previous incarnation are gone with it.
+  impl_->dispatch_meta_.clear();
+  // Persist the advanced epoch and the invalidations: a later load must not hand the old
+  // epoch out again or revive a plan that was in flight.
+  if (impl_->store_) impl_->save_locked();
 }
 
 const PlannerContext& RecoveryPlanner::context() const { return impl_->ctx_; }
-CoordinatorEpoch RecoveryPlanner::current_epoch() const { return impl_->ctx_.epoch; }
+CoordinatorEpoch RecoveryPlanner::current_epoch() const {
+  std::lock_guard<std::mutex> lk(impl_->mu_);
+  return impl_->ctx_.epoch;
+}
 std::vector<RecoveryPlan> RecoveryPlanner::plans() const {
   std::lock_guard<std::mutex> lk(impl_->mu_);
   std::vector<RecoveryPlan> out;
   for (const auto& kv : impl_->plans_) out.push_back(kv.second);
   return out;
 }
-std::size_t RecoveryPlanner::history_size() const { return impl_->history_.size(); }
-std::vector<std::string> RecoveryPlanner::history_summaries() const { return impl_->history_; }
+std::size_t RecoveryPlanner::history_size() const {
+  std::lock_guard<std::mutex> lk(impl_->mu_);
+  return impl_->history_.size();
+}
+std::vector<std::string> RecoveryPlanner::history_summaries() const {
+  std::lock_guard<std::mutex> lk(impl_->mu_);
+  return impl_->history_;
+}
 
 }  // namespace recovery_planner

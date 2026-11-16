@@ -121,9 +121,11 @@ RecoveryEconomics compute_economics(const RecoveryCandidate& candidate,
   e.deadline_slack = de.slack;
 
   // Progress-loss tolerance.
-  if (request.max_tolerated_progress_loss.has_value() && e.expected_lost_progress.has_value()) {
+  // An unknown progress loss never satisfies a stated tolerance.
+  if (request.max_tolerated_progress_loss.has_value()) {
     e.max_tolerated_progress_loss = *request.max_tolerated_progress_loss;
-    e.progress_loss_within_tolerance = e.expected_lost_progress->value() <= request.max_tolerated_progress_loss->value();
+    e.progress_loss_within_tolerance = e.expected_lost_progress.has_value() &&
+        e.expected_lost_progress->value() <= request.max_tolerated_progress_loss->value();
   }
 
   e.confidence = (cost && candidate.authority) ? candidate.authority->meta.confidence : Confidence::none();

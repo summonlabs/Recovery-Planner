@@ -73,6 +73,15 @@ FeasibilityEvaluation evaluate_feasibility(const RecoveryCandidate& candidate,
       hard(f, ev, RejectionReason::POLICY_GENERATION_STALE,
            "candidate policy generation does not match current policy generation");
     }
+    // The evidence itself says whether each authority is valid: an invalid one is never
+    // overridden by matching generations.
+    const auto& au = *candidate.authority;
+    if (!au.coordinator_authority_valid || !au.policy_authority_valid ||
+        !au.candidate_authority_valid || !au.execution_authority_valid) {
+      hard(f, ev, RejectionReason::STALE_AUTHORITY, "candidate authority evidence is not valid");
+    }
+    if (stale_or_expired(au.meta)) f.insufficient = true;
+    if (revalidation_needed(au.meta)) f.revalidation = true;
   } else {
     f.insufficient = true;
   }
@@ -113,6 +122,23 @@ FeasibilityEvaluation evaluate_feasibility(const RecoveryCandidate& candidate,
   if (candidate.checkpoint && candidate.checkpoint->state_generation != candidate.state_generation) {
     hard(f, ev, RejectionReason::STATE_GENERATION_STALE,
          "checkpoint state generation does not match the candidate state generation");
+  }
+
+  // 4c. A RESTORE reads its checkpoint: a corrupt or expired checkpoint cannot be restored.
+  if (candidate.strategy == RecoveryStrategy::RESTORE && candidate.checkpoint) {
+    const auto& cp = *candidate.checkpoint;
+    if (cp.integrity == StateIntegrity::CORRUPT) {
+      hard(f, ev, RejectionReason::INVALID_STATE_INTEGRITY, "checkpoint integrity is CORRUPT");
+    }
+    if (cp.meta.freshness == Freshness::EXPIRED) {
+      hard(f, ev, RejectionReason::EXPIRED_STATE, "checkpoint evidence is EXPIRED");
+    }
+    if (cp.integrity == StateIntegrity::UNCERTAIN || cp.integrity == StateIntegrity::NOT_VERIFIED ||
+        cp.integrity == StateIntegrity::UNKNOWN) {
+      f.insufficient = true;
+    }
+    if (stale_or_expired(cp.meta)) f.insufficient = true;
+    if (revalidation_needed(cp.meta)) f.revalidation = true;
   }
 
   // 5. Compatibility.
@@ -156,6 +182,12 @@ FeasibilityEvaluation evaluate_feasibility(const RecoveryCandidate& candidate,
   if (needs_live_target) {
     if (candidate.availability) {
       const auto& av = *candidate.availability;
+      // The evidence must describe the candidate's own target: availability of another
+      // worker or boot says nothing about where this plan would run.
+      if (av.worker != candidate.target_worker || av.boot != candidate.target_boot) {
+        hard(f, ev, RejectionReason::TARGET_INCARNATION_MISMATCH,
+             "availability evidence does not describe the candidate's target worker and boot");
+      }
       if (!av.is_alive || !ctx.worker_is_current(av.worker)) {
         hard(f, ev, RejectionReason::TARGET_UNAVAILABLE, "target worker is not alive/current");
       }
