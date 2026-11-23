@@ -11,6 +11,7 @@
 #include <memory>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -494,7 +495,18 @@ int main(int argc, char** argv) {
   Msg regA, regB;
   recv(*ca, regA);
   recv(*cb, regB);
-  if (regA.type != MsgType::REGISTER || regB.type != MsgType::REGISTER) {
+  // The two workers are started one after the other, but which of them connects
+  // first is up to the scheduler. The connections are matched to the workers by
+  // the identity each one registered; taken in accept order, the work ran on the
+  // target, the primary was killed, and the recovery was then dispatched over
+  // the connection of the worker that had just been killed.
+  if (regA.type == MsgType::REGISTER && regB.type == MsgType::REGISTER &&
+      regA.a == kWorkerB && regB.a == kWorkerA) {
+    std::swap(ca, cb);
+    std::swap(regA, regB);
+  }
+  if (regA.type != MsgType::REGISTER || regB.type != MsgType::REGISTER ||
+      regA.a != kWorkerA || regB.a != kWorkerB) {
     std::fprintf(stderr, "coordinator: registration mismatch\n"); return 6;
   }
 
